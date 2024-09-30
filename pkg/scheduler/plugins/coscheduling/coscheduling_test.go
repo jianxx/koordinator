@@ -133,7 +133,7 @@ func newTestSharedLister(pods []*corev1.Pod, nodes []*corev1.Node) *testSharedLi
 	}
 }
 
-func makePg(name, namespace string, min int32, creationTime *time.Time, minResource *corev1.ResourceList) *v1alpha1.PodGroup {
+func makePg(name, namespace string, min int32, creationTime *time.Time, minResource corev1.ResourceList) *v1alpha1.PodGroup {
 	var ti int32 = 10
 	pg := &v1alpha1.PodGroup{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
@@ -209,6 +209,7 @@ func newPluginTestSuit(t *testing.T, nodes []*corev1.Node, pgClientSet pgclients
 		schedulertesting.RegisterReservePlugin(Name, proxyNew),
 		schedulertesting.RegisterPermitPlugin(Name, proxyNew),
 		schedulertesting.RegisterPluginAsExtensions(Name, proxyNew, "PostBind"),
+		schedulertesting.RegisterPluginAsExtensions(Name, proxyNew, "PreEnqueue"),
 	}
 	fakeRecorder := record.NewFakeRecorder(1024)
 	eventRecorder := record.NewEventRecorderAdapter(fakeRecorder)
@@ -639,6 +640,7 @@ func TestPostFilter(t *testing.T) {
 			if tt.pod.Name == "pod3" {
 				wg.Add(2)
 			}
+
 			for _, pod := range tt.pods {
 				tmpPod := pod
 				suit.Handle.(framework.Framework).RunPermitPlugins(context.Background(), cycleState, tmpPod, "")
@@ -651,6 +653,7 @@ func TestPostFilter(t *testing.T) {
 					defer wg.Done()
 				}()
 			}
+
 			if tt.pod.Name == "pod3" {
 				totalWaitingPods := 0
 				suit.Handle.IterateOverWaitingPods(
@@ -1217,20 +1220,31 @@ func schedulePod(ctx context.Context, suit *pluginTestSuit, fwk framework.Framew
 		UnschedulablePlugins: sets.Set[string]{},
 	}
 
+	fitError := &framework.FitError{
+		Pod:         pod,
+		NumAllNodes: 1,
+		Diagnosis:   diagnosis,
+	}
+
+	// Run "preEnqueue" plugins
+	s := suit.plugin.(*Coscheduling).PreEnqueue(ctx, pod)
+	if !s.IsSuccess() {
+		info.result = "PreEnqueue"
+		return result, fitError
+	}
+
 	// Run "prefilter" plugins.
-	_, _, s := suit.plugin.(*Coscheduling).BeforePreFilter(ctx, state, pod)
+	_, _, s = suit.plugin.(*Coscheduling).BeforePreFilter(ctx, state, pod)
 	if !s.IsSuccess() {
 		info.result = "PreFiler"
-	} else if injectFilterError {
-		info.result = "Filter"
+		return result, fitError
 	}
-	if info.result != "" {
-		return result, &framework.FitError{
-			Pod:         pod,
-			NumAllNodes: 1,
-			Diagnosis:   diagnosis,
-		}
+
+	if injectFilterError {
+		info.result = "PreFiler"
+		return result, fitError
 	}
+
 	return scheduler.ScheduleResult{
 		SuggestedHost: "fake-host",
 	}, err
@@ -1450,6 +1464,9 @@ func TestNoRejectWhenInvalidCycle(t *testing.T) {
 
 	_, status := suit.plugin.(*Coscheduling).PostFilter(ctx, framework.NewCycleState(), allPods[0], nil)
 	assert.False(t, status.IsSuccess())
+
+	status = suit.plugin.(*Coscheduling).PreEnqueue(ctx, memberPodsOfGang[util.GetId("default", gangNames[0])][0])
+	assert.True(t, status.IsSuccess())
 
 	_, _, status = suit.plugin.(*Coscheduling).BeforePreFilter(ctx, framework.NewCycleState(), memberPodsOfGang[util.GetId("default", gangNames[0])][0])
 	assert.False(t, status.IsSuccess())
